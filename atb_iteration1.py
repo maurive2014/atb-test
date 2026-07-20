@@ -20,10 +20,10 @@ def test_atb_config1_like_gemm():
     Mt, Nt, Kt = M // Pm, N // Pn, K // Pk
 
     
-    # With rho=4, the A side is broken into four 8x32 chunks while C keeps the
-    # full 32x32 PE-local tile live across the whole reduction.
+    # With rho=4, the A side is broken into four 8x32 chunks while C keeps the 
+    # tile across the whole k reduction.
     Ma = Mt // rho  # A is buffered in smaller rows than C.
-    assert Mt % rho == 0, # rho must evenly divide the  M tile
+    assert Mt % rho == 0 # rho must evenly divide the  M tile
 
     LyA = [S(1), S(0)]
     LyB = [S(0), S(2)]
