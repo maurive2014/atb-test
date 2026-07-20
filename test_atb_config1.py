@@ -75,7 +75,7 @@ def test_atb_config1_like_gemm():
                 A_sub: TyI[Ma, Kt]
                 A_sub[:, :] = local_A[r * Ma : (r + 1) * Ma, :]
                 # Use an explicit scalar reduction for the row chunk.
-                # This is slower than `allo.matmul`, but it keeps the first
+                # This loop is slower than `allo.matmul`, but it keeps the first
                 # prototype away from the backend's vectorized matmul layout
                 # optimization, which is where the earlier build failures came from.
                 for i in range(Ma):
