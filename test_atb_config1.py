@@ -70,20 +70,28 @@ def test_atb_config1_like_gemm():
             # - A_sub is short-lived and only holds 1/rho of the rows at a time.
             #   rho = 4 means "use four smaller A chunks for one C tile".
             C_out: TyO[Mt, Nt] = C_in
-            with allo.meta_for(rho) as r:
-                # After sharding across the K-stage axis, each PE only sees Kt columns.
-                A_sub: TyI[Ma, Kt]
-                A_sub[:, :] = local_A[r * Ma : (r + 1) * Ma, :]
-                # Use an explicit scalar reduction for the row chunk.
-                # This loop is slower than `allo.matmul`, but it keeps the first
-                # prototype away from the backend's vectorized matmul layout
-                # optimization, which is where the earlier build failures came from.
-                for i in range(Ma):
-                    for j in range(Nt):
-                        acc: TyO = C_out[r * Ma + i, j]
-                        for k in range(Kt):
-                            acc += A_sub[i, k] * local_B[k, j]
-                        C_out[r * Ma + i, j] = acc
+            # Explicitly unroll the four ATB row chunks.
+            # This keeps the asymmetry visible, but avoids a fragile indexed
+            # update pattern that the AIE lowering path was miscompiling.
+            A_0: TyI[Ma, Kt]
+            A_0[:, :] = local_A[0:Ma, :]
+            C_0: TyO[Ma, Nt] = allo.matmul(A_0, local_B)
+            C_out[0:Ma, :] += C_0
+
+            A_1: TyI[Ma, Kt]
+            A_1[:, :] = local_A[Ma : 2 * Ma, :]
+            C_1: TyO[Ma, Nt] = allo.matmul(A_1, local_B)
+            C_out[Ma : 2 * Ma, :] += C_1
+
+            A_2: TyI[Ma, Kt]
+            A_2[:, :] = local_A[2 * Ma : 3 * Ma, :]
+            C_2: TyO[Ma, Nt] = allo.matmul(A_2, local_B)
+            C_out[2 * Ma : 3 * Ma, :] += C_2
+
+            A_3: TyI[Ma, Kt]
+            A_3[:, :] = local_A[3 * Ma : 4 * Ma, :]
+            C_3: TyO[Ma, Nt] = allo.matmul(A_3, local_B)
+            C_out[3 * Ma : 4 * Ma, :] += C_3
 
             # Ping-pong the partial C tile to the next K stage, then drain it
             # to the final output when we reach the last stage.
@@ -102,7 +110,7 @@ def test_atb_config1_like_gemm():
         C = np.zeros((M, N)).astype(np.int32)
         mod(A, B, C)
         ref = A.astype(np.int32) @ B.astype(np.int32)
-        np.testing.assert_allclose(C, ref, atol=1e-5)
+        np.testing.assert_array_equal(C, ref)
         print("PASSED!")
     else:
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
