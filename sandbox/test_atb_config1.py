@@ -3,7 +3,7 @@
 
 import allo
 from allo.backend.aie import is_available
-from allo.ir.types import Stream, int16
+from allo.ir.types import Stream, int16, int32
 import allo.dataflow as df
 from allo.memory import Layout
 import numpy as np
@@ -22,7 +22,8 @@ def test_atb_config1_like_gemm():
     # also satisfy the backend's vectorized matmul tile requirements.
     # The 2x2x2 grid gives us 8 logical kernels, which fits the default
     # 4x4 mesh that Allo uses when no device_type is passed.
-    Ty = int16
+    TyI = int16
+    TyO = int32
     M, N, K = 64, 64, 64
     Pm, Pn, Pk = 2, 2, 2
     rho = 4
@@ -31,6 +32,8 @@ def test_atb_config1_like_gemm():
     # One output tile per PE row/column, and one K chunk per pipeline stage.
     # With rho=4, the A side is broken into four 8x32 chunks while C keeps the
     # full 32x32 PE-local tile live across the whole reduction.
+    # We widen C to int32 so the backend does not try to legalize an i16 vector
+    # add on the partial sum.
     Ma = Mt // rho  # A is buffered in smaller row chunks than C.
     assert Mt % rho == 0, "rho must evenly divide the PE-local M tile"
 
@@ -42,20 +45,20 @@ def test_atb_config1_like_gemm():
     LyC = [S(1), S(2)]
 
     @df.region()
-    def top(A: Ty[M, K], B: Ty[K, N], C: Ty[M, N]):
+    def top(A: TyI[M, K], B: TyI[K, N], C: TyO[M, N]):
         # Each entry in the pipe holds one PE-local C tile.
         # The first dimension is the K-pipeline stage; the last two are the PE grid.
-        pipe: Stream[Ty[Mt, Nt], 2][Pk - 1, Pm, Pn]
+        pipe: Stream[TyO[Mt, Nt], 2][Pk - 1, Pm, Pn]
 
         # The kernel grid is [K stage, PE row, PE column].
         @df.kernel(mapping=[Pk, Pm, Pn], args=[A, B, C])
         def gemm(
-            local_A: Ty[M, K] @ LyA,
-            local_B: Ty[K, N] @ LyB,
-            local_C: Ty[M, N] @ LyC,
+            local_A: TyI[M, K] @ LyA,
+            local_B: TyI[K, N] @ LyB,
+            local_C: TyO[M, N] @ LyC,
         ):
             pk, pm, pn = df.get_pid()
-            C_in: Ty[Mt, Nt]
+            C_in: TyO[Mt, Nt]
             # The partial C tile arrives from the previous K stage.
             with allo.meta_if(pk > 0):
                 C_in[:, :] = pipe[pk - 1, pm, pn].get()
@@ -63,34 +66,51 @@ def test_atb_config1_like_gemm():
                 C_in[:, :] = 0
 
             # This is the asymmetric buffering part:
-            # - C_sum is the long-lived buffer and keeps the whole PE-local tile.
+            # - C_out is the long-lived buffer and keeps the whole PE-local tile.
             # - A_sub is short-lived and only holds 1/rho of the rows at a time.
             #   rho = 4 means "use four smaller A chunks for one C tile".
-            C_sum: Ty[Mt, Nt] = C_in
-            with allo.meta_for(rho) as r:
-                # After sharding across the K-stage axis, each PE only sees Kt columns.
-                A_sub: Ty[Ma, Kt]
-                A_sub[:, :] = local_A[r * Ma : (r + 1) * Ma, :]
-                C_sum[r * Ma : (r + 1) * Ma, :] += allo.matmul(A_sub, local_B)
+            C_out: TyO[Mt, Nt] = C_in
+            # Explicitly unroll the four ATB row chunks.
+            # This keeps the asymmetry visible, but avoids a fragile indexed
+            # update pattern that the AIE lowering path was miscompiling.
+            A_0: TyI[Ma, Kt]
+            A_0[:, :] = local_A[0:Ma, :]
+            C_0: TyO[Ma, Nt] = allo.matmul(A_0, local_B)
+            C_out[0:Ma, :] += C_0
+
+            A_1: TyI[Ma, Kt]
+            A_1[:, :] = local_A[Ma : 2 * Ma, :]
+            C_1: TyO[Ma, Nt] = allo.matmul(A_1, local_B)
+            C_out[Ma : 2 * Ma, :] += C_1
+
+            A_2: TyI[Ma, Kt]
+            A_2[:, :] = local_A[2 * Ma : 3 * Ma, :]
+            C_2: TyO[Ma, Nt] = allo.matmul(A_2, local_B)
+            C_out[2 * Ma : 3 * Ma, :] += C_2
+
+            A_3: TyI[Ma, Kt]
+            A_3[:, :] = local_A[3 * Ma : 4 * Ma, :]
+            C_3: TyO[Ma, Nt] = allo.matmul(A_3, local_B)
+            C_out[3 * Ma : 4 * Ma, :] += C_3
 
             # Ping-pong the partial C tile to the next K stage, then drain it
             # to the final output when we reach the last stage.
             with allo.meta_if(pk < Pk - 1):
-                pipe[pk, pm, pn].put(C_sum)
+                pipe[pk, pm, pn].put(C_out)
             with allo.meta_elif(pk == Pk - 1):
-                local_C[:, :] = C_sum
+                local_C[:, :] = C_out
 
     if is_available():
         # Keep the build call as close as possible to test_pingpong_gemm.py.
         mod = df.build(top, target="aie")
 
-        # Small integer values keep the reference result safely in range.
+        # Small integer values keep the reference result safely in range for int32.
         A = np.random.randint(-2, 2, (M, K)).astype(np.int16)
         B = np.random.randint(-2, 2, (K, N)).astype(np.int16)
-        C = np.zeros((M, N)).astype(np.int16)
+        C = np.zeros((M, N)).astype(np.int32)
         mod(A, B, C)
         ref = A.astype(np.int32) @ B.astype(np.int32)
-        np.testing.assert_array_equal(C.astype(np.int32), ref)
+        np.testing.assert_array_equal(C, ref)
         print("PASSED!")
     else:
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
