@@ -13,44 +13,46 @@ S = Layout.Shard
 
 def test_atb_config1_like_gemm():
     # This is a small ATB-style GEMM demo, not the paper-scale config1.
-    # We keep the same idea:
-    # - split the work over a 2D PE grid
-    # - keep one C tile alive across several smaller A tiles
-    # - use a ping-pong stream to pass partial sums along the K pipeline
     #
-    # The sizes below are chosen so the example fits the default AIE mesh and
-    # also satisfy the backend's vectorized matmul tile requirements.
-    # The 2x2x2 grid gives us 8 logical kernels, which fits the default
-    # 4x4 mesh that Allo uses when no device_type is passed.
+    # The core idea is still the same:
+    # - keep one C tile alive across the whole K reduction
+    # - split A into rho smaller row chunks inside the kernel
+    # - pass the partial C tile through a ping-pong stream
+    #
+    # The current AIE frontend/backend path seems happier when:
+    # - C is copied into a fresh local buffer first
+    # - the rho row chunks are updated in a simple compile-time loop
+    # rather than by repeatedly aliasing and slicing the same value.
     TyI = int16
     TyO = int32
+
+    # Small demo sizes. These are chosen to stay close to the ping-pong GEMM
+    # example while still giving us a visible asymmetric buffering ratio.
     M, N, K = 64, 64, 64
     Pm, Pn, Pk = 2, 2, 2
     rho = 4
+
     assert M % Pm == 0 and N % Pn == 0 and K % Pk == 0
     Mt, Nt, Kt = M // Pm, N // Pn, K // Pk
-    # One output tile per PE row/column, and one K chunk per pipeline stage.
-    # With rho=4, the A side is broken into four 8x32 chunks while C keeps the
-    # full 32x32 PE-local tile live across the whole reduction.
-    # We widen C to int32 so the backend does not try to legalize an i16 vector
-    # add on the partial sum.
-    Ma = Mt // rho  # A is buffered in smaller row chunks than C.
+
+    # rho=4 means A is buffered in four smaller row chunks while C stays live
+    # as one PE-local tile.
+    Ma = Mt // rho
     assert Mt % rho == 0, "rho must evenly divide the PE-local M tile"
 
     # A is sharded by PE row and K stage.
     LyA = [S(1), S(0)]
     # B is sharded by K stage and PE column.
     LyB = [S(0), S(2)]
-    # C is sharded by PE row and PE column.
+    # C is sharded by PE row and PE column, so the kernel sees a full logical
+    # C buffer but each PE only owns one tile-shaped shard.
     LyC = [S(1), S(2)]
 
     @df.region()
     def top(A: TyI[M, K], B: TyI[K, N], C: TyO[M, N]):
-        # Each entry in the pipe holds one PE-local C tile.
-        # The first dimension is the K-pipeline stage; the last two are the PE grid.
+        # One tile per PE. The first dimension is the K pipeline stage.
         pipe: Stream[TyO[Mt, Nt], 2][Pk - 1, Pm, Pn]
 
-        # The kernel grid is [K stage, PE row, PE column].
         @df.kernel(mapping=[Pk, Pm, Pn], args=[A, B, C])
         def gemm(
             local_A: TyI[M, K] @ LyA,
@@ -58,56 +60,55 @@ def test_atb_config1_like_gemm():
             local_C: TyO[M, N] @ LyC,
         ):
             pk, pm, pn = df.get_pid()
+
+            # Load the running C tile from the previous K stage.
             C_in: TyO[Mt, Nt]
-            # The partial C tile arrives from the previous K stage.
             with allo.meta_if(pk > 0):
                 C_in[:, :] = pipe[pk - 1, pm, pn].get()
             with allo.meta_else():
                 C_in[:, :] = 0
 
-            # This is the asymmetric buffering part:
-            # - C_out is the long-lived buffer and keeps the whole PE-local tile.
-            # - A_sub is short-lived and only holds 1/rho of the rows at a time.
-            #   rho = 4 means "use four smaller A chunks for one C tile".
-            C_out: TyO[Mt, Nt] = C_in
-            # Explicitly unroll the four ATB row chunks.
-            # This keeps the asymmetry visible, but avoids a fragile indexed
-            # update pattern that the AIE lowering path was miscompiling.
-            A_0: TyI[Ma, Kt]
-            A_0[:, :] = local_A[0:Ma, :]
-            C_0: TyO[Ma, Nt] = allo.matmul(A_0, local_B)
-            C_out[0:Ma, :] += C_0
+            # Make C_out a real local buffer first. This avoids the "C_out is
+            # just an alias of C_in" pattern that was triggering layout issues.
+            C_out: TyO[Mt, Nt] = 0
+            C_out[:, :] = C_in
 
-            A_1: TyI[Ma, Kt]
-            A_1[:, :] = local_A[Ma : 2 * Ma, :]
-            C_1: TyO[Ma, Nt] = allo.matmul(A_1, local_B)
-            C_out[Ma : 2 * Ma, :] += C_1
+            # ATB row chunks:
+            # each iteration computes one smaller A slice and updates the
+            # corresponding rows of the live C tile.
+            k0 = pk * Kt
+            k1 = k0 + Kt
+            n0 = pn * Nt
+            n1 = n0 + Nt
+            with allo.meta_for(rho) as r:
+                row = r * Ma
 
-            A_2: TyI[Ma, Kt]
-            A_2[:, :] = local_A[2 * Ma : 3 * Ma, :]
-            C_2: TyO[Ma, Nt] = allo.matmul(A_2, local_B)
-            C_out[2 * Ma : 3 * Ma, :] += C_2
+                # The row chunk is computed directly from slices of the live
+                # tiles. This is the closest pattern to the slice examples that
+                # already work in Allo.
+                C_out[row : row + Ma, :] = allo.add(
+                    allo.matmul(
+                        local_A[row : row + Ma, k0:k1],
+                        local_B[k0:k1, n0:n1],
+                    ),
+                    C_in[row : row + Ma, :],
+                )
 
-            A_3: TyI[Ma, Kt]
-            A_3[:, :] = local_A[3 * Ma : 4 * Ma, :]
-            C_3: TyO[Ma, Nt] = allo.matmul(A_3, local_B)
-            C_out[3 * Ma : 4 * Ma, :] += C_3
-
-            # Ping-pong the partial C tile to the next K stage, then drain it
-            # to the final output when we reach the last stage.
+            # Send the updated C tile onward, or write it back on the final K
+            # stage.
             with allo.meta_if(pk < Pk - 1):
                 pipe[pk, pm, pn].put(C_out)
             with allo.meta_elif(pk == Pk - 1):
                 local_C[:, :] = C_out
 
     if is_available():
-        # Keep the build call as close as possible to test_pingpong_gemm.py.
         mod = df.build(top, target="aie")
 
-        # Small integer values keep the reference result safely in range for int32.
+        # Use tiny values so the int32 reference is easy to verify.
         A = np.random.randint(-2, 2, (M, K)).astype(np.int16)
         B = np.random.randint(-2, 2, (K, N)).astype(np.int16)
         C = np.zeros((M, N)).astype(np.int32)
+
         mod(A, B, C)
         ref = A.astype(np.int32) @ B.astype(np.int32)
         np.testing.assert_array_equal(C, ref)
