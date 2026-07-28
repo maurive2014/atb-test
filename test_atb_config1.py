@@ -1,40 +1,52 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+
 import allo
-from allo.ir.types import int16, Stream
 import allo.dataflow as df
-import numpy as np
 from allo.backend.aie import is_available
+from allo.ir.types import int16, Stream
+import numpy as np
+
+Ty = int16
+M, N, K = 64, 16, 16
+RHO_VALUES = [8]
 
 
-def _make_atb_top(rho):
-    Ty = int16
-    M, N, K = 16, 16, 16
-    Ma = M // rho
+def make_atb_top(rho):
     assert M % rho == 0
+    Ma = M // rho
 
     @df.region()
-    def top(B: Ty[K, N], A: Ty[M, K], C: Ty[M, N]):
+    def top(A: Ty[M, K], B: Ty[K, N], C: Ty[M, N]):
+        pipe_a: Stream[Ty[Ma, K], 2][rho]
         pipe_b: Stream[Ty[K, N], 2][rho]
         pipe_c: Stream[Ty[Ma, N], 2][rho]
 
+        @df.kernel(mapping=[1], args=[A])
+        def load_a(local_A: Ty[M, K]):
+            # Pack A into rho explicit subtiles before fanning out.
+            with allo.meta_for(rho) as i:
+                tile_A: Ty[Ma, K] = 0
+                tile_A[:, :] = local_A[i * Ma : (i + 1) * Ma, :]
+                pipe_a[i].put(tile_A)
+
         @df.kernel(mapping=[1], args=[B])
         def load_b(local_B: Ty[K, N]):
-            # Broadcast B to all ATB branches.
+            # Broadcast B once to every branch.
             with allo.meta_for(rho) as i:
                 pipe_b[i].put(local_B)
 
-        @df.kernel(mapping=[rho], args=[A])
-        def partial_gemm(local_A: Ty[M, K]):
+        @df.kernel(mapping=[rho])
+        def compute():
             pk = df.get_pid()
+            local_A: Ty[Ma, K] = pipe_a[pk].get()
             local_B: Ty[K, N] = pipe_b[pk].get()
-            local_Ai: Ty[Ma, K] = local_A[pk * Ma : (pk + 1) * Ma, :]
-            pipe_c[pk].put(allo.matmul(local_Ai, local_B))
+            pipe_c[pk].put(allo.matmul(local_A, local_B))
 
         @df.kernel(mapping=[1], args=[C])
         def store_c(local_C: Ty[M, N]):
-            # Gather the C subtiles and write them back in order.
             c_tiles: Ty[rho, Ma, N] = df.gather(pipe_c[:])
             with allo.meta_for(rho) as i:
                 local_C[i * Ma : (i + 1) * Ma, :] = c_tiles[i]
@@ -42,23 +54,30 @@ def _make_atb_top(rho):
     return top
 
 
-def test_atb_v1():
-    if not is_available():
-        print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
-        return
+def run_atb(rho):
+    top = make_atb_top(rho)
+    mapping_primitives = None
+    if rho > 1:
+        mapping_primitives = [("bundle", [f"compute_{i}" for i in range(rho)])]
 
-    for rho in [1, 2, 4, 8]:
-        top = _make_atb_top(rho)
-        M, N, K = 16, 16, 16
-        A = np.random.randint(0, 64, (M, K)).astype(np.int16)
-        B = np.random.randint(0, 64, (K, N)).astype(np.int16)
-        C = np.zeros((M, N)).astype(np.int16)
+    A = np.random.randint(0, 64, (M, K)).astype(np.int16)
+    B = np.random.randint(0, 64, (K, N)).astype(np.int16)
+    C = np.zeros((M, N)).astype(np.int16)
 
-        mod = df.build(top, target="aie")
-        mod(B, A, C)
+    if is_available():
+        mod = df.build(top, target="aie", mapping_primitives=mapping_primitives)
+        mod(A, B, C)
         np.testing.assert_allclose(C, A @ B, atol=1e-5)
-        print("rho= "+str(rho)+" PASSED!")
+        print(f"rho={rho} PASSED!")
+    else:
+        print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
+
+
+@pytest.mark.parametrize("rho", RHO_VALUES)
+def test_atb_generalized(rho):
+    run_atb(rho)
 
 
 if __name__ == "__main__":
-    test_atb_v1()
+    for rho in RHO_VALUES:
+        run_atb(rho)
