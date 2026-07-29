@@ -3,16 +3,16 @@
 
 import pytest
 
+import os
 import allo
 import allo.dataflow as df
 from allo.backend.aie import is_available
 from allo.ir.types import int16, Stream
 import numpy as np
 
-
 Ty = int16
 M, N, K = 64, 16, 16
-RHO_VALUES = [8, 8]
+RHO_VALUES = [1, 2, 4, 8]
 
 
 def make_atb_top(rho):
@@ -21,8 +21,17 @@ def make_atb_top(rho):
 
     @df.region()
     def top(A: Ty[M, K], B: Ty[K, N], C: Ty[M, N]):
+        pipe_a: Stream[Ty[Ma, K], 2][rho]
         pipe_b: Stream[Ty[K, N], 2][rho]
         pipe_c: Stream[Ty[Ma, N], 2][rho]
+
+        @df.kernel(mapping=[1], args=[A])
+        def load_a(local_A: Ty[M, K]):
+            # Pack A into rho explicit subtiles before fanning out.
+            with allo.meta_for(rho) as i:
+                tile_A: Ty[Ma, K] = 0
+                tile_A[:, :] = local_A[i * Ma : (i + 1) * Ma, :]
+                pipe_a[i].put(tile_A)
 
         @df.kernel(mapping=[1], args=[B])
         def load_b(local_B: Ty[K, N]):
@@ -30,15 +39,12 @@ def make_atb_top(rho):
             with allo.meta_for(rho) as i:
                 pipe_b[i].put(local_B)
 
-        @df.kernel(mapping=[rho], args=[A])
-        def branch(local_A: Ty[M, K]):
+        @df.kernel(mapping=[rho])
+        def compute():
             pk = df.get_pid()
-
-            # Load the local A subtile for this branch, compute, then emit C_i.
-            tile_A: Ty[Ma, K] = 0
-            tile_A[:, :] = local_A[pk * Ma : (pk + 1) * Ma, :]
+            local_A: Ty[Ma, K] = pipe_a[pk].get()
             local_B: Ty[K, N] = pipe_b[pk].get()
-            pipe_c[pk].put(allo.matmul(tile_A, local_B))
+            pipe_c[pk].put(allo.matmul(local_A, local_B))
 
         @df.kernel(mapping=[1], args=[C])
         def store_c(local_C: Ty[M, N]):
@@ -49,27 +55,18 @@ def make_atb_top(rho):
     return top
 
 
-def make_atb_mapping_primitives(rho):
-    if rho <= 1:
-        return None
-    return [("bundle", [f"branch_{i}" for i in range(rho)])]
-
-
 def run_atb(rho):
     top = make_atb_top(rho)
+    mapping_primitives = None
+    if rho > 1:
+        mapping_primitives = [("bundle", [f"compute_{i}" for i in range(rho)])]
 
     A = np.random.randint(0, 64, (M, K)).astype(np.int16)
     B = np.random.randint(0, 64, (K, N)).astype(np.int16)
     C = np.zeros((M, N)).astype(np.int16)
 
     if is_available():
-        # Bundle the branch replicas so the AIE placer sees a compact
-        # broadcast-fanout graph instead of a long chain.
-        mod = df.build(
-            top,
-            target="aie",
-            mapping_primitives=make_atb_mapping_primitives(rho),
-        )
+        mod = df.build(top, target="aie", mapping_primitives=mapping_primitives)
         mod(A, B, C)
         np.testing.assert_allclose(C, A @ B, atol=1e-5)
         print(f"rho={rho} PASSED!")
@@ -84,4 +81,6 @@ def test_atb_generalized(rho):
 
 if __name__ == "__main__":
     for rho in RHO_VALUES:
+        os.environ["FORCE_UNROLL_INDEX"] = "1"
         run_atb(rho)
+        del os.environ["FORCE_UNROLL_INDEX"] 
