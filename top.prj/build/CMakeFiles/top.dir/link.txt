@@ -1,0 +1,1 @@
+/usr/bin/g++-13 -Wl,--dependency-file=CMakeFiles/top.dir/link.d "CMakeFiles/top.dir/opt/allo/mlir-aie/runtime_lib/test_lib/test_utils.cpp.o" CMakeFiles/top.dir/test.cpp.o -o top  -lxrt_coreutil -lboost_program_options -lboost_filesystem
