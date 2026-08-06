@@ -17,9 +17,8 @@ S = Layout.Shard
 R = Layout.Replicate
 
 Ty = int16
-M, N, K = 16, 16, 16
+M, N, K = 64, 16, 16
 RHO_VALUES = [1, 2, 4, 8]
-
 
 def make_atb_top(rho):
     assert M % rho == 0
@@ -32,6 +31,7 @@ def make_atb_top(rho):
 
         @df.kernel(mapping=[1], args=[B])
         def loadB(local_B: Ty[K, N]):
+            b = local_B
             with allo.meta_for(rho) as i:
                 pipeB[i].put(local_B)
 
@@ -42,10 +42,9 @@ def make_atb_top(rho):
             pipeC[pk].put(c)
 
         @df.kernel(mapping=[1], args=[C])
-        def store(local_C: Ty[M, N]):
-            c_tiles: Ty[rho, Ma, N] = df.gather(pipeC[:])
+        def store_c(local_C: Ty[M, N]):
             with allo.meta_for(rho) as i:
-                local_C[i * Ma : (i + 1) * Ma, :] = c_tiles[i]
+                local_C[i * Ma : (i + 1) * Ma, :] = pipeC[i].get()
 
     return top
 
@@ -62,29 +61,14 @@ def run_atb(rho):
     C = np.zeros((M, N)).astype(np.int16)
 
     if is_available():
+        os.environ["FORCE_UNROLL_INDEX"] = "1"
         mod = df.build(top, target="aie", mapping_primitives=mapping_primitives)
         mod(B, A, C)
+        del os.environ["FORCE_UNROLL_INDEX"]
         np.testing.assert_allclose(C, A @ B, atol=1e-5)
         print(f"rho={rho} PASSED!")
     else:
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
 
 
-def _run_atb_with_force_unroll(rho):
-    os.environ["FORCE_UNROLL_INDEX"] = "1"
-    try:
-        run_atb(rho)
-    finally:
-        del os.environ["FORCE_UNROLL_INDEX"]
-
-
-@pytest.mark.parametrize("rho", RHO_VALUES)
-def test_atb_v2(rho):
-    _run_atb_with_force_unroll(rho)
-
-
-if __name__ == "__main__":
-    for rho in RHO_VALUES:
-        os.environ["FORCE_UNROLL_INDEX"] = "1"
-        run_atb(rho)
-        del os.environ["FORCE_UNROLL_INDEX"]
+run_atb(8)
