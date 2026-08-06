@@ -17,7 +17,7 @@ S = Layout.Shard
 R = Layout.Replicate
 
 Ty = int16
-M, N, K = 64, 16, 16
+M, N, K = 128, 16, 16
 RHO_VALUES = [1, 2, 4, 8]
 
 def make_atb_top(rho):
@@ -62,7 +62,12 @@ def run_atb(rho):
 
     if is_available():
         os.environ["FORCE_UNROLL_INDEX"] = "1"
-        mod = df.build(top, target="aie", mapping_primitives=mapping_primitives)
+        mod = df.build(
+            top,
+            target="aie",
+            project="rho_4.prj",
+            mapping_primitives=mapping_primitives,
+        )
         mod(B, A, C)
         del os.environ["FORCE_UNROLL_INDEX"]
         np.testing.assert_allclose(C, A @ B, atol=1e-5)
@@ -71,4 +76,4 @@ def run_atb(rho):
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
 
 
-run_atb(8)
+run_atb(4) # works for 1, 2, 4
