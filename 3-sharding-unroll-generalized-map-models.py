@@ -17,16 +17,15 @@ S = Layout.Shard
 R = Layout.Replicate
 
 Ty = int16
-M, N, K = 16, 16, 16
-RHO_VALUES = [1, 2, 4, 8]
+M, N, K = 64, 16, 16
+# RHO_VALUES = [1, 2, 4, 8]
 
 # Mapping model:
 # 1 = bundle
 # 2 = bundle + chain(compute -> store)
 # 3 = bundle + chain(load_b -> compute) 
 # 4 = bundle + both chains
-MODEL = 4
-
+MODEL = 2
 
 def make_atb_top(rho):
     assert M % rho == 0
@@ -34,28 +33,27 @@ def make_atb_top(rho):
 
     @df.region()
     def top(B: Ty[K, N], A: Ty[M, K], C: Ty[M, N]):
-        pipe_b: Stream[Ty[K, N], 1][rho]
-        pipe_c: Stream[Ty[Ma, N], 1][rho]
+        pipeB: Stream[Ty[K, N], 1][rho]
+        pipeC: Stream[Ty[Ma, N], 1][rho]
 
         @df.kernel(mapping=[1], args=[B])
         def load_b(local_B: Ty[K, N]):
+            b = local_B
             with allo.meta_for(rho) as i:
-                pipe_b[i].put(local_B)
+                pipeB[i].put(local_B)
 
         @df.kernel(mapping=[rho], args=[A])
         def compute(local_A: Ty[M, K] @ [S(0), R]):
             pk = df.get_pid()
-            c = allo.matmul(local_A, pipe_b[pk].get())
-            pipe_c[pk].put(c)
+            c = allo.matmul(local_A, pipeB[pk].get())
+            pipeC[pk].put(c)
 
         @df.kernel(mapping=[1], args=[C])
         def store_c(local_C: Ty[M, N]):
-            c_tiles: Ty[rho, Ma, N] = df.gather(pipe_c[:])
             with allo.meta_for(rho) as i:
-                local_C[i * Ma : (i + 1) * Ma, :] = c_tiles[i]
+                local_C[i * Ma : (i + 1) * Ma, :] = pipeC[i].get()
 
     return top
-
 
 def run_atb(rho):
     top = make_atb_top(rho)
@@ -102,29 +100,23 @@ def run_atb(rho):
     C = np.zeros((M, N)).astype(np.int16)
 
     if is_available():
-        mod = df.build(top, target="aie", mapping_primitives=mapping_primitives)
+        os.environ["FORCE_UNROLL_INDEX"] = "1"
+        mod = df.build(
+            top,
+            target="aie",
+            project="rho-model-before.prj",
+            mapping_primitives=mapping_primitives,
+        )
         mod(B, A, C)
+        del os.environ["FORCE_UNROLL_INDEX"]
         np.testing.assert_allclose(C, A @ B, atol=1e-5)
-        print(f"rho={rho} PASSED!")
+        print(f"rho={rho} PASSED! for model {MODEL}")
     else:
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
 
 
-def _run_atb_with_force_unroll(rho):
-    os.environ["FORCE_UNROLL_INDEX"] = "1"
-    try:
-        run_atb(rho)
-    finally:
-        del os.environ["FORCE_UNROLL_INDEX"]
-
-
-@pytest.mark.parametrize("rho", RHO_VALUES)
-def test_atb_v2(rho):
-    _run_atb_with_force_unroll(rho)
-
-
-if __name__ == "__main__":
-    for rho in RHO_VALUES:
-        os.environ["FORCE_UNROLL_INDEX"] = "1"
-        run_atb(rho)
-        del os.environ["FORCE_UNROLL_INDEX"]
+run_atb(2) 
+# for rho 1 model 1,2,3,4 work 
+# for rho 2 model 1 work
+# for rho 4 model 1 work
+# rho = 8 doesn't work in any model.

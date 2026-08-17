@@ -3,8 +3,6 @@
 
 import os
 
-import pytest
-
 import allo
 import allo.dataflow as df
 import numpy as np
@@ -65,7 +63,7 @@ def run_atb(rho):
         mod = df.build(
             top,
             target="aie",
-            project="rho_4.prj",
+            project="rho8.prj",
             mapping_primitives=mapping_primitives,
         )
         mod(B, A, C)
@@ -76,4 +74,4 @@ def run_atb(rho):
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
 
 
-run_atb(4) # works for 1, 2, 4
+run_atb(8) # works for 1, 2, 4
