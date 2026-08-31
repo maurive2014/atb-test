@@ -15,8 +15,7 @@ def gen_temporal_atb_mapping_primitive(
 ):
     """Chain (k, rho) steps and bundle spatial tiles like library GEMM.
 
-    This helper shows a possible lowering to today's mapping primitives. For
-    rho=2, every ``rho=0`` / ``rho=1`` pair represents ping and pong using the
+    For rho=2, every ``rho=0`` / ``rho=1`` pair represents ping and pong using the
     same B tile before the chain advances to the next K tile.
     """
 
@@ -62,8 +61,6 @@ def gen_temporal_atb_mapping_primitive(
 def TEMPORAL_ATB_GEMM(
     M, N, K, Pm, Pn, Pk, TyI, TyO, rho=2, col_num=4, row_num=4
 ):
-    """GEMM frontend sketch with ``rho`` as mapping dimension four."""
-
     assert rho == 2
     Mt, Nt, Kt = M // Pm, N // Pn, K // Pk
     At = Mt // rho
@@ -74,10 +71,10 @@ def TEMPORAL_ATB_GEMM(
     Sn = df.Axis.Spatial(Pn, name="n")        # axis 2
     Tr = df.Axis.Temporal(rho, name="rho")    # axis 3
 
-    # A/C rows are first divided spatially by m, then temporally by rho.
+    # A rows are divided spatially by m, then temporally by rho.
     LyA = [S(1) * S(3), S(0)]
     LyB = [S(0), S(2)]
-    LyC = [S(1) * S(3), S(2)]
+    LyC = [S(1), S(2)]
 
     @df.region()
     def top(A: TyI[M, K], B: TyI[K, N], C: TyO[M, N]):
@@ -99,8 +96,7 @@ def TEMPORAL_ATB_GEMM(
                     for i, j in allo.grid(At, Nt):
                         C_acc[r * At + i, j] += C_tile[i, j]
 
-            with allo.meta_for(Tr.extent) as r:
-                C_port.put(C_acc[r * At : (r + 1) * At, :])
+            C_port.put(C_acc)
 
     mapping_primitives = gen_temporal_atb_mapping_primitive(
         Pm, Pn, Pk, rho, col_num, row_num
